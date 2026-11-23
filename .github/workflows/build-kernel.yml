@@ -1,56 +1,76 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Hannah Kernel Forge — Standalone Local Kernel Compiler Script
+#!/sbin/sh
+# Recovery Installer Binary (TWRP / OrangeFox / AnyKernel3-compatible)
 # Target: Moto E5 Plus (Global / US Retail) (hannah / Qualcomm MSM8937 (Snapdragon 435))
-# Kernel Base: Linux 4.9 | Arch: arm64 | Toolchain: Neutron Clang 18
+# Mode: Safe Ramdisk & Sysfs Tuning Only (Preserves Existing Kernel Binary)
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-KERNEL_DIR="${KERNEL_DIR:-$ROOT_DIR/kernel-src}"
-TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-$HOME/.local/toolchains/neutron-clang-18}"
-JOBS="${JOBS:-$(nproc --all)}"
+OUTFD="/proc/self/fd/$2"
+ZIPFILE="$3"
+WORK_DIR="/tmp/hannah_forge_ak3"
 
-echo "[1/5] Preparing Moto E5 Plus (hannah) kernel source..."
-if [[ ! -d "$KERNEL_DIR/.git" ]]; then
-  git clone --depth=1 --branch "lineage-20" \
-    "https://github.com/LineageOS/android_kernel_motorola_msm8953.git" "$KERNEL_DIR"
+ui_print() {
+  echo -e "ui_print $1\nui_print" > "$OUTFD"
+}
+
+abort() {
+  ui_print "ERROR: $1"
+  rm -rf "$WORK_DIR"
+  exit 1
+}
+
+ui_print "================================================"
+ui_print " Hannah Kernel Forge — Moto E5 Plus (hannah)"
+ui_print " Mode: Safe Ramdisk & Sysfs Tuning Only (Preserves Existing Kernel Binary)"
+ui_print "================================================"
+
+# Verify target device codename before touching boot partition
+ACTUAL_DEVICE="$(getprop ro.product.device)"
+case "$ACTUAL_DEVICE" in
+  hannah|hannah_*|moto_e5_plus)
+    ui_print "Verified device: $ACTUAL_DEVICE"
+    ;;
+  *)
+    abort "Device mismatch: expected 'hannah', found '$ACTUAL_DEVICE'"
+    ;;
+esac
+
+rm -rf "$WORK_DIR"
+mkdir -p "$WORK_DIR"
+unzip -o "$ZIPFILE" -d "$WORK_DIR" >/dev/null 2>&1 || abort "Failed to extract recovery zip"
+
+BOOT_BLOCK="/dev/block/bootdevice/by-name/boot"
+[ -e "$BOOT_BLOCK" ] || abort "Boot partition not found at $BOOT_BLOCK"
+
+ui_print "Backing up current boot image to /tmp/boot-backup-hannah.img..."
+dd if="$BOOT_BLOCK" of="/tmp/boot-backup-hannah.img" bs=4096 2>/dev/null || abort "Boot partition backup failed"
+
+# Check for compiled kernel binary
+if [ -s "$WORK_DIR/Image.gz-dtb" ]; then
+  ui_print "Found compiled kernel binary: Image.gz-dtb"
+  if [ -x "$WORK_DIR/tools/magiskboot" ] || command -v magiskboot >/dev/null 2>&1; then
+    MB="$(command -v magiskboot || echo "$WORK_DIR/tools/magiskboot")"
+    cd "$WORK_DIR" || abort "Cannot enter work dir"
+    "$MB" unpack "/tmp/boot-backup-hannah.img" || abort "magiskboot unpack failed"
+    cp "$WORK_DIR/Image.gz-dtb" "$WORK_DIR/kernel"
+    "$MB" repack "/tmp/boot-backup-hannah.img" "$WORK_DIR/boot-new.img" || abort "magiskboot repack failed"
+    dd if="$WORK_DIR/boot-new.img" of="$BOOT_BLOCK" bs=4096 2>/dev/null || abort "Failed flashing new boot image"
+    ui_print "Flashed patched kernel (Image.gz-dtb) to $BOOT_BLOCK"
+  else
+    abort "magiskboot binary not present in recovery. Flash via GitHub Actions AnyKernel3 build."
+  fi
+else
+  ui_print "No Image.gz-dtb binary inside zip — preserving existing kernel binary."
 fi
 
-echo "[2/5] Preparing Neutron Clang 18..."
-if [[ ! -d "$TOOLCHAIN_DIR/bin" ]]; then
-  mkdir -p "$TOOLCHAIN_DIR"
-  curl -sSL "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" -o "$TOOLCHAIN_DIR/antman"
-  chmod +x "$TOOLCHAIN_DIR/antman"
-  (cd "$TOOLCHAIN_DIR" && ./antman -S=latest)
-fi
-export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+# Install post-boot sysfs tuning script safely if /system_root or /vendor is mounted
+for INIT_DIR in /system_root/system/etc/init /system/system/etc/init /vendor/etc/init; do
+  if [ -d "$INIT_DIR" ] && [ -w "$INIT_DIR" ]; then
+    cp "$WORK_DIR/ramdisk/init.hannah_forge.rc" "$INIT_DIR/init.hannah_forge.rc"
+    chmod 0644 "$INIT_DIR/init.hannah_forge.rc"
+    ui_print "Installed post-boot tuning script to $INIT_DIR/init.hannah_forge.rc"
+    break
+  fi
+done
 
-echo "[3/5] Applying eBPF backports and custom performance/battery driver patches..."
-chmod +x "$ROOT_DIR/scripts/apply_patches.sh"
-"$ROOT_DIR/scripts/apply_patches.sh" "$KERNEL_DIR"
-
-echo "[4/5] Merging defconfig fragment and compiling Image.gz-dtb (-j$JOBS)..."
-cat "$ROOT_DIR/configs/hannah_ebpf_custom.fragment" >> "$KERNEL_DIR/arch/arm64/configs/hannah_defconfig"
-
-cd "$KERNEL_DIR"
-export ARCH="arm64"
-export SUBARCH="arm64"
-export LOCALVERSION="-HannahForge-eBPF"
-export CC="ccache clang"
-ccache -M 4G
-
-make O=out "hannah_defconfig"
-make -j"$JOBS" O=out \
-  ARCH="arm64" \
-  CC=clang LLVM=1 LLVM_IAS=0 AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-  CROSS_COMPILE="aarch64-linux-gnu-" \
-  Image.gz-dtb
-
-echo "[5/5] Packaging flashable AnyKernel3 zip..."
-rm -rf "$ROOT_DIR/anykernel-out"
-git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$ROOT_DIR/anykernel-out"
-cp "$ROOT_DIR/anykernel/anykernel.sh" "$ROOT_DIR/anykernel-out/anykernel.sh"
-cp "$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb" "$ROOT_DIR/anykernel-out/"
-OUT_ZIP="$ROOT_DIR/MotoE5Plus-hannah-eBPF-$(date +%Y%m%d).zip"
-(cd "$ROOT_DIR/anykernel-out" && zip -r9 "$OUT_ZIP" . -x ".git*" "README.md")
-echo "Flashable kernel package created: $OUT_ZIP"
+rm -rf "$WORK_DIR"
+ui_print "Done! Reboot system to apply Moto E5 Plus (hannah) configuration."
+exit 0
