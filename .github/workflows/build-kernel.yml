@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Hannah Kernel Forge — Standalone Local Kernel Compiler Script
+# Target: Moto E5 Plus (Global / US Retail) (hannah / Qualcomm MSM8937 (Snapdragon 435))
+# Kernel Base: Linux 4.9 | Arch: arm64 | Toolchain: Neutron Clang 18
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KERNEL_DIR="${KERNEL_DIR:-$ROOT_DIR/kernel-src}"
+TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-$HOME/.local/toolchains/neutron-clang-18}"
+JOBS="${JOBS:-$(nproc --all)}"
+
+echo "[1/5] Preparing Moto E5 Plus (hannah) kernel source..."
+if [[ ! -d "$KERNEL_DIR/.git" ]]; then
+  git clone --depth=1 --branch "lineage-20" \
+    "https://github.com/LineageOS/android_kernel_motorola_msm8953.git" "$KERNEL_DIR"
+fi
+
+echo "[2/5] Preparing Neutron Clang 18..."
+if [[ ! -d "$TOOLCHAIN_DIR/bin" ]]; then
+  mkdir -p "$TOOLCHAIN_DIR"
+  curl -sSL "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" -o "$TOOLCHAIN_DIR/antman"
+  chmod +x "$TOOLCHAIN_DIR/antman"
+  (cd "$TOOLCHAIN_DIR" && ./antman -S=latest)
+fi
+export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+
+echo "[3/5] Applying eBPF backports and custom performance/battery driver patches..."
+chmod +x "$ROOT_DIR/scripts/apply_patches.sh"
+"$ROOT_DIR/scripts/apply_patches.sh" "$KERNEL_DIR"
+
+echo "[4/5] Merging defconfig fragment and compiling Image.gz-dtb (-j$JOBS)..."
+cat "$ROOT_DIR/configs/hannah_ebpf_custom.fragment" >> "$KERNEL_DIR/arch/arm64/configs/hannah_defconfig"
+
+cd "$KERNEL_DIR"
+export ARCH="arm64"
+export SUBARCH="arm64"
+export LOCALVERSION="-HannahForge-eBPF"
+export CC="ccache clang"
+ccache -M 4G
+
+make O=out "hannah_defconfig"
+make -j"$JOBS" O=out \
+  ARCH="arm64" \
+  CC=clang LLVM=1 LLVM_IAS=0 AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+  CROSS_COMPILE="aarch64-linux-gnu-" \
+  Image.gz-dtb
+
+echo "[5/5] Packaging flashable AnyKernel3 zip..."
+rm -rf "$ROOT_DIR/anykernel-out"
+git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$ROOT_DIR/anykernel-out"
+cp "$ROOT_DIR/anykernel/anykernel.sh" "$ROOT_DIR/anykernel-out/anykernel.sh"
+cp "$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb" "$ROOT_DIR/anykernel-out/"
+OUT_ZIP="$ROOT_DIR/MotoE5Plus-hannah-eBPF-$(date +%Y%m%d).zip"
+(cd "$ROOT_DIR/anykernel-out" && zip -r9 "$OUT_ZIP" . -x ".git*" "README.md")
+echo "Flashable kernel package created: $OUT_ZIP"
